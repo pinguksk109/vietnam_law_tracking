@@ -8,8 +8,8 @@
 2. VnExpressとTuoi Tre NewsのRSSまたは一覧ページから記事を取得
 3. 直近7日間の記事を対象に、英語・ベトナム語キーワードで事前絞り込み
 4. 最大20件の記事をGeminiへまとめて送信
-5. 日本企業、IT企業、外国人駐在員への影響を日本語JSONで取得
-6. LINE Messaging APIのPush Messageで最大5メッセージを送信
+5. 日本企業、IT企業、外国人駐在員への影響を `category`、法令番号、検索キーワード付き日本語JSONで取得
+6. LINE Messaging APIのPush Messageで、National Law Portalで人間が確認するための情報を含む最大5メッセージを送信
 
 ## 環境変数
 
@@ -66,4 +66,5 @@ LINE Developers ConsoleでMessaging APIチャネルを作成し、チャネル�
 - 実行をまたいだ重複排除は行いません。
 - ニュースサイトのHTMLやRSS仕様変更には追随が必要です。
 - Geminiが報道内容を正しく解釈できない可能性があるため、重要事項は公式情報で再確認してください。
+- National Law Portalの検索は自動化せず、通知に表示されたベトナム語キーワードと検索ページを使って人間が確認してください。
 - 本番運用時には通知部分をAmazon SESへ置き換える予定です。

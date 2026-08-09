@@ -9,13 +9,14 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ARTICLES: usize = 20;
 const MAX_LINE_MESSAGES: usize = 5;
 const LINE_TEXT_LIMIT: usize = 4_900;
 const SOURCE_USER_AGENT: &str = "vietnam-law-tracking/0.1";
+const NATIONAL_LAW_PORTAL_URL: &str = "https://phapluat.gov.vn/he-thong-van-ban-phap-luat";
 
 const KEYWORDS: &[&str] = &[
     "law",
@@ -79,6 +80,37 @@ struct Article {
     source: String,
 }
 
+#[derive(Debug)]
+struct RssFetchResult {
+    articles: Vec<Article>,
+    feeds: usize,
+    fetched: usize,
+}
+
+#[derive(Debug)]
+struct ArticleFilterResult {
+    keyword_matched: usize,
+    deduplicated: usize,
+    articles: Vec<Article>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EnrichmentStats {
+    requested: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+impl EnrichmentStats {
+    fn record(&mut self, succeeded: bool) {
+        if succeeded {
+            self.succeeded += 1;
+        } else {
+            self.failed += 1;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TargetPeriod {
     start: DateTime<Utc>,
@@ -100,13 +132,32 @@ struct Change {
     published_date: String,
     effective_date: Option<String>,
     law_number: Option<String>,
+    #[serde(default)]
+    search_keywords: Vec<String>,
     target: String,
     impact: String,
     action: String,
     confidence: String,
+    #[serde(default)]
+    category: String,
     source_url: String,
     official_url: Option<String>,
 }
+
+const DEFAULT_CATEGORY: &str = "business";
+const DEFAULT_CONFIDENCE: &str = "要確認";
+const VALID_CATEGORIES: &[&str] = &[
+    "business",
+    "labor",
+    "tax",
+    "visa",
+    "daily_life",
+    "healthcare",
+    "education",
+    "transportation",
+    "banking",
+    "technology",
+];
 
 #[derive(Debug, Deserialize)]
 struct RssFeed {
@@ -125,23 +176,15 @@ struct RssChannel {
 #[derive(Debug, Deserialize)]
 struct RssEntry {
     title: Option<String>,
-    link: Option<RssLink>,
+    link: Option<String>,
     description: Option<String>,
     summary: Option<String>,
+
     #[serde(rename = "pubDate")]
     pub_date: Option<String>,
+
     published: Option<String>,
     updated: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RssLink {
-    Text(String),
-    Object {
-        #[serde(rename = "@href")]
-        href: String,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,7 +222,6 @@ struct LinePushRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), LambdaError> {
-
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -191,77 +233,89 @@ async fn main() -> Result<(), LambdaError> {
 
 async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
     info!("weekly law tracking started");
-    let config = load_config()?;
+    let config = load_config()
+        .context("configuration load failed")
+        .map_err(|err| {
+            error!(error = %format!("{err:#}"), "configuration load failed");
+            LambdaError::from(err)
+        })?;
     let period = calculate_target_period(Utc::now(), config.lookback_days);
     info!(start = %period.local_start, end = %period.local_end, "target period calculated");
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
         .user_agent(SOURCE_USER_AGENT)
-        .build()?;
-    let (vnexpress, tuoitre) = tokio::join!(
-        fetch_vnexpress_articles(&client, &period),
-        fetch_tuoitre_articles(&client, &period)
-    );
-    let both_sources_failed = vnexpress.is_err() && tuoitre.is_err();
-    let vnexpress = match vnexpress {
-        Ok(articles) => {
-            info!(count = articles.len(), "VnExpress articles fetched");
-            articles
+        .build()
+        .context("HTTP client initialization failed")
+        .map_err(|err| {
+            error!(error = %format!("{err:#}"), "HTTP client initialization failed");
+            LambdaError::from(err)
+        })?;
+    let vnexpress = match fetch_vnexpress_articles(&client, &period).await {
+        Ok(result) => {
+            info!(
+                source = "VnExpress",
+                feeds = result.feeds,
+                count = result.fetched,
+                "RSS fetched"
+            );
+            result.articles
         }
         Err(err) => {
-            error!(error = %err, "VnExpress fetch failed");
-            Vec::new()
+            error!(error = %format!("{err:#}"), "VnExpress RSS fetch failed");
+            return Err(err.into());
         }
     };
-    let tuoitre = match tuoitre {
-        Ok(articles) => {
-            info!(count = articles.len(), "Tuoi Tre News articles fetched");
-            articles
-        }
-        Err(err) => {
-            error!(error = %err, "Tuoi Tre News fetch failed");
-            Vec::new()
-        }
-    };
-    if both_sources_failed {
-        let message = vec![format!(
-            "【ベトナム法改正週間レポート】\n対象期間：{}〜{}\nニュースサイトから記事を取得できませんでした。",
-            period.local_start, period.local_end
-        )];
-        send_line_messages(&client, &config, message).await?;
-        return Err(anyhow!("both news sources failed or returned no articles").into());
-    }
+    let rss_fetched = vnexpress.len();
 
-    let mut articles = vnexpress;
-    articles.extend(tuoitre);
-    let mut articles = filter_and_deduplicate_articles(articles, &period);
+    let filter_result = filter_and_deduplicate_articles(vnexpress, &period);
+    info!(count = filter_result.keyword_matched, "keyword matched");
+    info!(count = filter_result.deduplicated, "deduplicated");
+    let selected_for_gemini = filter_result.articles.len();
+    info!(count = selected_for_gemini, "selected for Gemini");
+    let mut articles = filter_result.articles;
+
+    let enrichment = enrich_article_bodies(&client, &mut articles).await;
     info!(
-        count = articles.len(),
-        "articles after keyword filtering and deduplication"
+        requested = enrichment.requested,
+        succeeded = enrichment.succeeded,
+        failed = enrichment.failed,
+        "article body enrichment completed"
     );
-    enrich_article_bodies(&client, &mut articles).await;
+
     let report = if articles.is_empty() {
         create_empty_report()
     } else {
         match analyze_with_gemini(&client, &config, &period, &articles).await {
             Ok(report) => report,
             Err(err) => {
-                error!(error = %err, "Gemini processing failed");
-                let error_messages = vec![format!(
-                    "【ベトナム法改正週間レポート】\n対象期間：{}〜{}\nGeminiによる分析に失敗しました。ログを確認してください。",
-                    period.local_start, period.local_end
-                )];
-                if let Err(line_err) = send_line_messages(&client, &config, error_messages).await {
-                    error!(error = %line_err, "Gemini error notification failed");
-                }
+                error!(error = %format!("{err:#}"), "Gemini processing failed");
                 return Err(err.into());
             }
         }
     };
+    info!(count = report.changes.len(), "Gemini changes");
     let messages = format_line_messages(&period, &report);
-    send_line_messages(&client, &config, messages).await?;
-    info!("weekly law tracking finished");
+    info!(
+        messages = messages.len(),
+        changes = report.changes.len(),
+        "LINE notification prepared"
+    );
+    send_line_messages(&client, &config, messages)
+        .await
+        .context("LINE notification failed")
+        .map_err(|err| {
+            error!(error = %format!("{err:#}"), "LINE notification failed");
+            LambdaError::from(err)
+        })?;
+    info!(
+        rss_fetched,
+        keyword_matched = filter_result.keyword_matched,
+        deduplicated = filter_result.deduplicated,
+        selected_for_gemini,
+        gemini_changes = report.changes.len(),
+        "weekly law tracking completed"
+    );
     Ok(json!({"status": "ok", "changes": report.changes.len()}))
 }
 
@@ -297,25 +351,40 @@ fn calculate_target_period(now: DateTime<Utc>, lookback_days: i64) -> TargetPeri
     }
 }
 
-async fn fetch_vnexpress_articles(client: &Client, period: &TargetPeriod) -> Result<Vec<Article>> {
+async fn fetch_vnexpress_articles(
+    client: &Client,
+    period: &TargetPeriod,
+) -> Result<RssFetchResult> {
     let urls = [
+        // 法律・行政
         "https://vnexpress.net/rss/phap-luat.rss",
+        "https://vnexpress.net/rss/thoi-su.rss",
+        // 企業・経済
         "https://vnexpress.net/rss/kinh-doanh.rss",
+        // IT・AI・データ・通信
         "https://vnexpress.net/rss/khoa-hoc-cong-nghe.rss",
+        // 駐在員の生活
+        "https://vnexpress.net/rss/doi-song.rss",
+        "https://vnexpress.net/rss/suc-khoe.rss",
+        "https://vnexpress.net/rss/giao-duc.rss",
+        "https://vnexpress.net/rss/oto-xe-may.rss",
+        // 外国人・国際情勢
         "https://vnexpress.net/rss/the-gioi.rss",
     ];
     fetch_rss_sources(client, period, &urls, "VnExpress").await
 }
 
+#[allow(dead_code)]
 async fn fetch_tuoitre_articles(client: &Client, period: &TargetPeriod) -> Result<Vec<Article>> {
+    debug!("fetching Tuoi Tre News articles");
     let rss_urls = [
         "https://tuoitrenews.vn/rss.htm",
         "https://tuoitrenews.vn/rss",
     ];
     match fetch_rss_sources(client, period, &rss_urls, "Tuoi Tre News").await {
-        Ok(articles) if !articles.is_empty() => Ok(articles),
+        Ok(result) if !result.articles.is_empty() => Ok(result.articles),
         Err(err) => {
-            warn!(error = %err, "Tuoi Tre RSS failed; trying listing page");
+            warn!(error = %format!("{err:#}"), "Tuoi Tre RSS failed; trying listing page");
             fetch_tuoitre_listing(client, period).await
         }
         _ => fetch_tuoitre_listing(client, period).await,
@@ -324,44 +393,57 @@ async fn fetch_tuoitre_articles(client: &Client, period: &TargetPeriod) -> Resul
 
 async fn fetch_rss_sources(
     client: &Client,
-    period: &TargetPeriod,
+    _period: &TargetPeriod,
     urls: &[&str],
     source: &str,
-) -> Result<Vec<Article>> {
+) -> Result<RssFetchResult> {
     let mut all = Vec::new();
-    let mut success = false;
+    let mut successful_feeds = 0;
+    let mut fetched = 0;
     for url in urls {
-        match request_text(|| client.get(*url)).await {
+        debug!(source, url, "fetching RSS source");
+        match request_text(|| client.get(*url))
+            .await
+            .with_context(|| format!("{source} RSS request failed"))
+        {
             Ok(xml) => {
-                success = true;
-                let feed: RssFeed =
-                    from_str(&xml).with_context(|| format!("RSS parse failed for {source}"))?;
+                let feed: RssFeed = match from_str(&xml) {
+                    Ok(feed) => feed,
+                    Err(err) => {
+                        warn!(source, url, error = %err, "RSS source failed: parse error");
+                        continue;
+                    }
+                };
+                successful_feeds += 1;
                 let mut entries = feed.entries;
                 if let Some(channel) = feed.channel {
                     entries.extend(channel.items);
                 }
-                all.extend(
-                    entries
-                        .into_iter()
-                        .filter_map(|entry| rss_entry_to_article(entry, source))
-                        .filter(|a| in_period(a, period)),
-                );
+                let articles = entries
+                    .into_iter()
+                    .filter_map(|entry| rss_entry_to_article(entry, source))
+                    .collect::<Vec<_>>();
+                fetched += articles.len();
+                all.extend(articles);
+                debug!(source, url, count = fetched, "RSS source processed");
             }
             Err(err) => warn!(source, url, error = %err, "RSS source failed"),
         }
     }
-    if !success {
+    if successful_feeds == 0 {
         bail!("all {source} RSS sources failed");
     }
-    Ok(all)
+    Ok(RssFetchResult {
+        articles: all,
+        feeds: successful_feeds,
+        fetched,
+    })
 }
 
 fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
     let title = clean_text(entry.title?);
-    let url = match entry.link? {
-        RssLink::Text(value) => value,
-        RssLink::Object { href } => href,
-    };
+    let url = entry.link?;
+
     if title.is_empty() || url.is_empty() {
         return None;
     }
@@ -370,6 +452,7 @@ fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
         .or(entry.published)
         .or(entry.updated)
         .and_then(|value| parse_date(&value));
+
     Some(Article {
         title,
         url,
@@ -380,8 +463,12 @@ fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
     })
 }
 
+#[allow(dead_code)]
 async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result<Vec<Article>> {
-    let html = request_text(|| client.get("https://tuoitrenews.vn/")).await?;
+    debug!("fetching Tuoi Tre listing page");
+    let html = request_text(|| client.get("https://tuoitrenews.vn/"))
+        .await
+        .context("Tuoi Tre listing request failed")?;
     let document = Html::parse_document(&html);
     let link_selector = Selector::parse("a").map_err(|_| anyhow!("invalid listing selector"))?;
     let mut result = Vec::new();
@@ -410,6 +497,7 @@ async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result
     if result.is_empty() {
         bail!("Tuoi Tre listing contained no articles");
     }
+    debug!(count = result.len(), "Tuoi Tre listing parsed");
     Ok(result
         .into_iter()
         .filter(|a| in_period(a, period))
@@ -423,16 +511,39 @@ where
     for attempt in 0..3 {
         let response = make_request().send().await;
         match response {
-            Ok(response) if response.status().is_success() => return Ok(response.text().await?),
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .text()
+                    .await
+                    .context("HTTP response body read failed");
+            }
             Ok(response) if should_retry(response.status()) && attempt < 2 => {
+                warn!(
+                    attempt = attempt + 1,
+                    status = %response.status(),
+                    "HTTP request failed; retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(250 * 2_u64.pow(attempt))).await;
             }
-            Ok(response) => bail!("HTTP request failed with status {}", response.status()),
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "HTTP request failed with status {}: {}",
+                    status,
+                    truncate_for_log(&body, 2_000)
+                );
+            }
             Err(err) if attempt < 2 => {
-                warn!(attempt = attempt + 1, error = %err, "HTTP request failed; retrying");
+                warn!(
+                    attempt = attempt + 1,
+                    error = %err,
+                    "HTTP request failed; retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(250 * 2_u64.pow(attempt))).await;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) if err.is_timeout() => return Err(anyhow!("HTTP timeout: {err}")),
+            Err(err) => return Err(anyhow!("HTTP transport error: {err}")),
         }
     }
     bail!("HTTP request exhausted retries")
@@ -460,24 +571,41 @@ fn in_period(article: &Article, period: &TargetPeriod) -> bool {
 }
 
 fn filter_and_deduplicate_articles(
-    mut articles: Vec<Article>,
+    articles: Vec<Article>,
     period: &TargetPeriod,
-) -> Vec<Article> {
-    articles.retain(|article| keyword_match(article) && in_period(article, period));
+) -> ArticleFilterResult {
+    let mut articles = articles
+        .into_iter()
+        .filter(|article| keyword_match(article) && in_period(article, period))
+        .collect::<Vec<_>>();
+    let keyword_matched = articles.len();
     let mut urls = HashSet::new();
     let mut titles = HashSet::new();
     articles.retain(|article| {
         urls.insert(article.url.trim().to_ascii_lowercase())
             && titles.insert(normalize_title(&article.title))
     });
+    let deduplicated = articles.len();
     articles.sort_by_key(|article| std::cmp::Reverse(article.published_at));
     articles.truncate(MAX_ARTICLES);
-    articles
+    ArticleFilterResult {
+        keyword_matched,
+        deduplicated,
+        articles,
+    }
 }
 
-async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) {
+async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) -> EnrichmentStats {
+    let mut stats = EnrichmentStats {
+        requested: articles.len(),
+        ..EnrichmentStats::default()
+    };
     for article in articles {
-        match request_text(|| client.get(&article.url)).await {
+        debug!(url = %article.url, "fetching article body");
+        match request_text(|| client.get(&article.url))
+            .await
+            .context("article body fetch failed")
+        {
             Ok(html) => {
                 let document = Html::parse_document(&html);
                 let selectors = [
@@ -497,17 +625,24 @@ async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) {
                 });
                 if let Some(body) = body.filter(|value| !value.is_empty()) {
                     article.body = Some(body.chars().take(8_000).collect());
+                    stats.record(true);
+                    debug!(url = %article.url, "article body captured");
                 } else {
+                    stats.record(false);
                     warn!(url = %article.url, "article body was not found; using summary");
                 }
             }
-            Err(err) => warn!(
-                url = %article.url,
-                error = %err,
-                "article body fetch failed; using summary"
-            ),
+            Err(err) => {
+                stats.record(false);
+                warn!(
+                    url = %article.url,
+                    error = %err,
+                    "article body fetch failed; using summary"
+                )
+            }
         }
     }
+    stats
 }
 
 fn keyword_match(article: &Article) -> bool {
@@ -536,24 +671,110 @@ async fn analyze_with_gemini(
 ) -> Result<Report> {
     info!(count = articles.len(), "sending articles to Gemini");
     let prompt = build_gemini_prompt(period, articles);
+    debug!(prompt_chars = prompt.chars().count(), "Gemini prompt built");
+    debug!(prompt = %prompt, "Gemini API prompt");
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         config.gemini_model, config.gemini_api_key
     );
     let body = json!({"contents": [{"parts": [{"text": prompt}]}]});
-    let response = request_text(|| client.post(&url).json(&body)).await?;
-    let gemini: GeminiResponse =
-        serde_json::from_str(&response).context("Gemini response JSON parse failed")?;
+    // If DEBUG_GEMINI_PROMPT=1 is set, emit the full request body (prompt included) to logs.
+    if env::var("DEBUG_GEMINI_PROMPT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        match serde_json::to_string_pretty(&body) {
+            Ok(body_str) => {
+                debug!(gemini_request = %truncate_for_log(&body_str, 40_000), "Gemini request body (truncated)");
+            }
+            Err(_) => {
+                debug!("Gemini request body could not be serialized for logging");
+            }
+        }
+    }
+    let response = request_text(|| client.post(&url).json(&body))
+        .await
+        .context("Gemini HTTP request failed")?;
+    debug!(
+        response = %truncate_for_log(&response, 4_000),
+        "Gemini API raw response"
+    );
+    debug!(
+        response_chars = response.chars().count(),
+        "Gemini API response received"
+    );
+    info!("Gemini response received");
+    let gemini: GeminiResponse = serde_json::from_str(&response).with_context(|| {
+        format!(
+            "Gemini response JSON parse failed; raw={}",
+            truncate_for_log(&response, 4_000)
+        )
+    })?;
     let text = gemini
         .candidates
         .and_then(|items| items.into_iter().next())
         .and_then(|candidate| candidate.content)
         .and_then(|content| content.parts)
         .and_then(|parts| parts.into_iter().find_map(|part| part.text))
-        .ok_or_else(|| anyhow!("Gemini response contained no text"))?;
+        .ok_or_else(|| anyhow!("Gemini response candidates/content/text missing"))?;
+    debug!(text = %truncate_for_log(&text, 4_000), "Gemini generated text");
     let json_text = remove_json_code_block(&text)
-        .ok_or_else(|| anyhow!("Gemini response did not contain JSON"))?;
-    serde_json::from_str(&json_text).context("Gemini report JSON parse failed")
+        .ok_or_else(|| anyhow!("Gemini extracted text did not contain JSON"))?;
+    debug!(json = %truncate_for_log(&json_text, 4_000), "Gemini extracted JSON");
+    let mut report: Report =
+        serde_json::from_str(&json_text).context("Gemini report JSON parse failed")?;
+    normalize_report(&mut report);
+    Ok(report)
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("...(truncated)");
+    }
+    truncated
+}
+
+fn normalize_report(report: &mut Report) {
+    for change in &mut report.changes {
+        change.category = normalize_category(&change.category);
+        change.confidence = normalize_confidence(&change.confidence);
+        change.search_keywords =
+            normalize_search_keywords(std::mem::take(&mut change.search_keywords));
+    }
+}
+
+fn normalize_search_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for keyword in keywords {
+        let keyword = keyword.trim().to_string();
+        if keyword.is_empty() || !seen.insert(keyword.to_lowercase()) {
+            continue;
+        }
+        normalized.push(keyword);
+        if normalized.len() == 3 {
+            break;
+        }
+    }
+    normalized
+}
+
+fn normalize_category(category: &str) -> String {
+    let normalized = category.trim().to_lowercase();
+    if VALID_CATEGORIES.contains(&normalized.as_str()) {
+        normalized
+    } else {
+        DEFAULT_CATEGORY.to_string()
+    }
+}
+
+fn normalize_confidence(confidence: &str) -> String {
+    match confidence.trim() {
+        "報道段階" => "報道段階".to_string(),
+        "要確認" => "要確認".to_string(),
+        _ => DEFAULT_CONFIDENCE.to_string(),
+    }
 }
 
 fn build_gemini_prompt(period: &TargetPeriod, articles: &[Article]) -> String {
@@ -577,9 +798,12 @@ fn build_gemini_prompt(period: &TargetPeriod, articles: &[Article]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    format!(
-        "あなたは日本企業向けのベトナム法務ニュース編集者です。対象期間は{}〜{}です。\n以下の記事から、企業や外国人に影響する法改正・制度変更だけを抽出してください。出力は日本語にし、記事に書かれていない内容を断定しないでください。推測は推測と明記してください。公布日、施行日、法令番号を混同しないでください。公式情報を確認できていない場合は「報道段階」または「要確認」にしてください。単なる事件や政治ニュースは除外してください。重要な変更がない場合はchangesを空配列にしてください。MarkdownではなくJSONだけを返してください。\n\nJSON形式:\n{{\"summary\":\"今週全体の概要\",\"changes\":[{{\"title\":\"変更内容の日本語タイトル\",\"summary\":\"変更内容の要約\",\"published_date\":\"記事の公開日\",\"effective_date\":null,\"law_number\":null,\"target\":\"対象\",\"impact\":\"日本企業、IT企業、外国人駐在員への影響\",\"action\":\"対応\",\"confidence\":\"公式確認済み/報道段階/要確認\",\"source_url\":\"URL\",\"official_url\":null}}]}}\n\n記事一覧:\n{}",
+    let prompt = format!(
+        "あなたは日本企業向けのベトナム法務・制度変更ニュース編集者です。 私たちは、日本企業向けにベトナムでIT・ソフトウェア開発のオフショア事業を行っています。 そのため、日本企業の事業運営への影響だけでなく、ベトナムに駐在する日本人社員やその家族の生活に影響する制度変更も重視してください。 対象期間は{}〜{}です。 以下の記事から、日本企業、IT・オフショア開発企業、外国人駐在員に影響する法改正・制度変更・重要な行政変更を抽出してください。 特に以下の観点を重視してください。 【企業・事業への影響】 - ベトナムで事業を行う日本企業 - IT・ソフトウェア開発・オフショア開発企業 - ベトナム法人や現地拠点の設立・運営 - ベトナム人エンジニアなど現地従業員の雇用、給与、最低賃金、社会保険 - 法人税、VAT、源泉税などの税制 - 外国企業への投資規制、許認可、行政手続き - IT、AI、データ保護、個人情報、サイバーセキュリティ、通信に関する規制 【日本人駐在員・家族への影響】 - ビザ、在留資格、労働許可、入出国手続き - 個人所得税、社会保険 - 銀行口座、送金、決済 - 住宅、賃貸、不動産に関する制度 - 医療、健康保険、病院利用 - 子どもの教育、学校、インターナショナルスクール - 自動車、バイク、運転免許、交通ルール - 携帯電話、SIM、インターネット、通信サービス - 電気、水道など生活インフラ - 物価、公共料金、生活コスト - 治安、防犯、外国人に関係する重要な規制変更 - その他、ベトナムで生活する日本人駐在員とその家族に実務的な影響がある制度変更 単なる事件、事故、政治ニュース、一般的な経済ニュースは除外してください。 ただし、制度変更や規制変更によって駐在員の日常生活に直接影響する場合は対象にしてください。 出力は日本語にしてください。 記事に書かれていない内容を断定しないでください。 推測は推測と明記してください。 公布日、施行日、法令番号を混同しないでください。 公式情報を確認できていない場合は「報道段階」または「要確認」にしてください。 重要な変更がない場合はchangesを空配列にしてください。 categoryは business, labor, tax, visa, daily_life, healthcare, education, transportation, banking, technology のいずれか1つにしてください。 MarkdownではなくJSONだけを返してください。 JSON形式: {{ \"summary\":\"今週全体の概要\", \"changes\":[ {{ \"title\":\"変更内容の日本語タイトル\", \"summary\":\"変更内容の要約\", \"published_date\":\"記事の公開日\", \"effective_date\":null, \"law_number\":null, \"target\":\"対象となる企業・人\", \"impact\":\"日本企業、オフショア開発事業、日本人駐在員・家族への具体的な影響\", \"action\":\"確認・対応すべきこと\", \"confidence\":\"公式確認済み/報道段階/要確認\", \"category\":\"business\", \"source_url\":\"URL\", \"official_url\":null }} ] }} 記事一覧: {}",
         period.local_start, period.local_end, entries
+    );
+    format!(
+        "{prompt} 法令番号が記事本文または概要に明記されている場合のみlaw_numberに記載してください。記事にない法令番号を推測・補完・生成してはいけません。記事から確認できない場合はnullにしてください。 search_keywordsは最大3件とし、National Law Portalで検索できるベトナム語を原則として使用してください。日本語のみの検索語は生成しないでください。優先順位は、記事に明記された法令番号、記事本文から特定できる正式なベトナム語制度名・法令名、検索に有効な短いベトナム語です。記事に存在しない法令番号をsearch_keywordsに生成してはいけません。 confidenceは「報道段階」または「要確認」のみを使用してください。今回National Law Portalは確認していないため「公式確認済み」は使用しないでください。 official_urlは記事本文に公式URLが明記されている場合のみ設定し、確認できない場合はnullにしてください。National Law Portalの個別法令URLを推測して生成してはいけません。期待するJSONの各changeにはsearch_keywordsを含めてください。"
     )
 }
 
@@ -629,7 +853,32 @@ fn format_line_messages(period: &TargetPeriod, report: &Report) -> Vec<String> {
         report.summary
     )];
     for (index, change) in report.changes.iter().enumerate() {
-        messages.push(format!("■ {}. {}\n概要：\n{}\n\n対象：\n{}\n\n影響：\n{}\n\n対応：\n{}\n\n施行日：{}\n確度：{}\nニュース：{}\n公式情報：{}", index + 1, change.title, change.summary, change.target, change.impact, change.action, change.effective_date.as_deref().unwrap_or("不明"), change.confidence, change.source_url, change.official_url.as_deref().unwrap_or("不明")));
+        messages.push(format!(
+            "■ {}. {}\n\nカテゴリ：{}\n確度：{}\n\n法令番号：\n{}\n\n施行日：\n{}\n\n概要：\n{}\n\n対象：\n{}\n\n影響：\n{}\n\n対応：\n{}\n\n【公式確認用】\n検索キーワード：\n{}\n\nNational Law Portal：\n{}\n\nニュース：\n{}\n\n公式情報：\n{}\n\n※重要な変更は、上記キーワードをNational Law Portalで検索し、法令番号・施行日・適用対象を公式情報で確認してください。",
+            index + 1,
+            change.title,
+            change.category,
+            change.confidence,
+            change.law_number.as_deref().unwrap_or("記事から確認できず"),
+            change.effective_date.as_deref().unwrap_or("要確認"),
+            change.summary,
+            change.target,
+            change.impact,
+            change.action,
+            if change.search_keywords.is_empty() {
+                "記事タイトルまたは制度名で検索してください".to_string()
+            } else {
+                change
+                    .search_keywords
+                    .iter()
+                    .map(|keyword| format!("・{keyword}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+            NATIONAL_LAW_PORTAL_URL,
+            change.source_url,
+            change.official_url.as_deref().unwrap_or("未確認")
+        ));
     }
     split_line_messages(messages)
 }
@@ -707,6 +956,7 @@ async fn send_line_messages(client: &Client, config: &Config, messages: Vec<Stri
     if messages.is_empty() {
         bail!("no LINE messages to send");
     }
+    let message_count = messages.len();
     let body = LinePushRequest {
         to: config.line_destination_id.clone(),
         messages: messages
@@ -723,11 +973,13 @@ async fn send_line_messages(client: &Client, config: &Config, messages: Vec<Stri
             .bearer_auth(&config.line_channel_access_token)
             .json(&body)
     })
-    .await?;
-    if !response.is_empty() {
-        info!("LINE API returned a response body");
-    }
-    info!("LINE notification sent");
+    .await
+    .context("LINE HTTP request failed")?;
+    debug!(
+        response_chars = response.chars().count(),
+        "LINE API response received"
+    );
+    info!(messages = message_count, "LINE notification sent");
     Ok(())
 }
 
@@ -799,7 +1051,50 @@ mod tests {
             article("Other", "https://example.test/a"),
             article(" TAX   LAW ", "https://example.test/b"),
         ];
-        assert_eq!(filter_and_deduplicate_articles(values, &period).len(), 1);
+        let result = filter_and_deduplicate_articles(values, &period);
+        assert_eq!(result.keyword_matched, 2);
+        assert_eq!(result.deduplicated, 1);
+        assert_eq!(result.articles.len(), 1);
+    }
+
+    #[test]
+    fn counts_selected_articles_after_max_articles() {
+        let now = Utc::now();
+        let period = calculate_target_period(now, 7);
+        let values = (0..25)
+            .map(|index| {
+                let mut value = article(
+                    &format!("Tax law {index}"),
+                    &format!("https://example.test/{index}"),
+                );
+                value.published_at = Some(now);
+                value
+            })
+            .collect();
+
+        let result = filter_and_deduplicate_articles(values, &period);
+        assert_eq!(result.keyword_matched, 25);
+        assert_eq!(result.deduplicated, 25);
+        assert_eq!(result.articles.len(), MAX_ARTICLES);
+    }
+
+    #[test]
+    fn counts_enrichment_successes_and_failures() {
+        let mut stats = EnrichmentStats {
+            requested: 3,
+            ..EnrichmentStats::default()
+        };
+        stats.record(true);
+        stats.record(false);
+        stats.record(true);
+        assert_eq!(
+            stats,
+            EnrichmentStats {
+                requested: 3,
+                succeeded: 2,
+                failed: 1,
+            }
+        );
     }
 
     #[test]
@@ -820,6 +1115,170 @@ mod tests {
         let messages = format_line_messages(&period, &create_empty_report());
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("重要な変更は確認できませんでした"));
+    }
+
+    #[test]
+    fn normalizes_invalid_category_to_business() {
+        let mut report = Report {
+            summary: "ok".into(),
+            changes: vec![Change {
+                title: "t".into(),
+                summary: "s".into(),
+                published_date: "2026-08-09".into(),
+                effective_date: None,
+                law_number: None,
+                search_keywords: Vec::new(),
+                target: "target".into(),
+                impact: "impact".into(),
+                action: "action".into(),
+                confidence: "公式確認済み".into(),
+                category: "unknown".into(),
+                source_url: "https://example.test".into(),
+                official_url: None,
+            }],
+        };
+        normalize_report(&mut report);
+        assert_eq!(report.changes[0].category, "business");
+        assert_eq!(report.changes[0].confidence, "要確認");
+    }
+
+    #[test]
+    fn keeps_category_in_line_messages() {
+        let period = calculate_target_period(Utc::now(), 7);
+        let report = Report {
+            summary: "ok".into(),
+            changes: vec![Change {
+                title: "t".into(),
+                summary: "s".into(),
+                published_date: "2026-08-09".into(),
+                effective_date: None,
+                law_number: None,
+                search_keywords: vec!["visa".into()],
+                target: "target".into(),
+                impact: "impact".into(),
+                action: "action".into(),
+                confidence: "要確認".into(),
+                category: "visa".into(),
+                source_url: "https://example.test".into(),
+                official_url: None,
+            }],
+        };
+        let messages = format_line_messages(&period, &report);
+        assert!(messages[0].contains("カテゴリ：visa"));
+    }
+
+    #[test]
+    fn normalizes_search_keywords() {
+        let keywords = normalize_search_keywords(vec![
+            "  first  ".into(),
+            "FIRST".into(),
+            "".into(),
+            "second".into(),
+            " third ".into(),
+            "fourth".into(),
+        ]);
+        assert_eq!(keywords, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn parses_search_keywords_and_defaults_when_missing() {
+        let with_keywords: Change = serde_json::from_str(
+            r#"{
+                "title":"t", "summary":"s", "published_date":"2026-08-09",
+                "effective_date":null, "law_number":"87/2026/TT-BCA",
+                "search_keywords":["87/2026/TT-BCA", "khai báo tạm trú người nước ngoài"],
+                "target":"target", "impact":"impact", "action":"action",
+                "confidence":"要確認", "category":"visa", "source_url":"https://example.test", "official_url":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(with_keywords.search_keywords.len(), 2);
+
+        let without_keywords: Change = serde_json::from_str(
+            r#"{
+                "title":"t", "summary":"s", "published_date":"2026-08-09",
+                "effective_date":null, "law_number":null,
+                "target":"target", "impact":"impact", "action":"action",
+                "confidence":"要確認", "category":"visa", "source_url":"https://example.test", "official_url":null
+            }"#,
+        )
+        .unwrap();
+        assert!(without_keywords.search_keywords.is_empty());
+    }
+
+    #[test]
+    fn includes_official_verification_details_in_line_messages() {
+        let period = calculate_target_period(Utc::now(), 7);
+        let report = Report {
+            summary: "ok".into(),
+            changes: vec![Change {
+                title: "t".into(),
+                summary: "s".into(),
+                published_date: "2026-08-09".into(),
+                effective_date: Some("2026-07-24".into()),
+                law_number: Some("87/2026/TT-BCA".into()),
+                search_keywords: vec!["khai báo tạm trú người nước ngoài".into()],
+                target: "target".into(),
+                impact: "impact".into(),
+                action: "action".into(),
+                confidence: "報道段階".into(),
+                category: "visa".into(),
+                source_url: "https://vnexpress.net/example".into(),
+                official_url: None,
+            }],
+        };
+        let messages = format_line_messages(&period, &report);
+        assert!(messages.iter().any(|message| message.contains("法令番号")));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("検索キーワード"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains(NATIONAL_LAW_PORTAL_URL))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("https://vnexpress.net/example"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("2026-07-24"))
+        );
+        assert!(messages.iter().any(|message| message.contains("報道段階")));
+    }
+
+    #[test]
+    fn shows_missing_law_number_in_line_messages() {
+        let period = calculate_target_period(Utc::now(), 7);
+        let report = Report {
+            summary: "ok".into(),
+            changes: vec![Change {
+                title: "t".into(),
+                summary: "s".into(),
+                published_date: "2026-08-09".into(),
+                effective_date: None,
+                law_number: None,
+                search_keywords: Vec::new(),
+                target: "target".into(),
+                impact: "impact".into(),
+                action: "action".into(),
+                confidence: "要確認".into(),
+                category: "business".into(),
+                source_url: "https://example.test".into(),
+                official_url: None,
+            }],
+        };
+        let messages = format_line_messages(&period, &report);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("記事から確認できず"))
+        );
     }
 
     #[test]
