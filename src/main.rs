@@ -179,6 +179,9 @@ struct LinePushRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), LambdaError> {
+
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .without_time()
@@ -227,7 +230,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
             period.local_start, period.local_end
         )];
         send_line_messages(&client, &config, message).await?;
-        bail!("both news sources failed or returned no articles");
+        return Err(anyhow!("both news sources failed or returned no articles").into());
     }
 
     let mut articles = vnexpress;
@@ -328,7 +331,7 @@ async fn fetch_rss_sources(
     let mut all = Vec::new();
     let mut success = false;
     for url in urls {
-        match request_text(client, || client.get(*url)).await {
+        match request_text(|| client.get(*url)).await {
             Ok(xml) => {
                 success = true;
                 let feed: RssFeed =
@@ -378,7 +381,7 @@ fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
 }
 
 async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result<Vec<Article>> {
-    let html = request_text(client, || client.get("https://tuoitrenews.vn/")).await?;
+    let html = request_text(|| client.get("https://tuoitrenews.vn/")).await?;
     let document = Html::parse_document(&html);
     let link_selector = Selector::parse("a").map_err(|_| anyhow!("invalid listing selector"))?;
     let mut result = Vec::new();
@@ -393,7 +396,7 @@ async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result
         let url = if href.starts_with("http") {
             href.to_string()
         } else {
-            format!("https://tuoitrenews.vn{}", href)
+            format!("https://tuoitrenews.vn{href}")
         };
         result.push(Article {
             title,
@@ -413,7 +416,7 @@ async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result
         .collect())
 }
 
-async fn request_text<F>(client: &Client, make_request: F) -> Result<String>
+async fn request_text<F>(make_request: F) -> Result<String>
 where
     F: Fn() -> RequestBuilder,
 {
@@ -474,7 +477,7 @@ fn filter_and_deduplicate_articles(
 
 async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) {
     for article in articles {
-        match request_text(client, || client.get(&article.url)).await {
+        match request_text(|| client.get(&article.url)).await {
             Ok(html) => {
                 let document = Html::parse_document(&html);
                 let selectors = [
@@ -538,7 +541,7 @@ async fn analyze_with_gemini(
         config.gemini_model, config.gemini_api_key
     );
     let body = json!({"contents": [{"parts": [{"text": prompt}]}]});
-    let response = request_text(client, || client.post(&url).json(&body)).await?;
+    let response = request_text(|| client.post(&url).json(&body)).await?;
     let gemini: GeminiResponse =
         serde_json::from_str(&response).context("Gemini response JSON parse failed")?;
     let text = gemini
@@ -714,7 +717,7 @@ async fn send_line_messages(client: &Client, config: &Config, messages: Vec<Stri
             })
             .collect(),
     };
-    let response = request_text(client, || {
+    let response = request_text(|| {
         client
             .post("https://api.line.me/v2/bot/message/push")
             .bearer_auth(&config.line_channel_access_token)
