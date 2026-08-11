@@ -10,6 +10,7 @@
 4. 最大20件の記事をGeminiへまとめて送信
 5. 日本企業、IT企業、外国人駐在員への影響を `category`、法令番号、検索キーワード付き日本語JSONで取得
 6. LINE Messaging APIのPush Messageで、National Law Portalで人間が確認するための情報を含む最大5メッセージを送信
+7. RSS、Rustフィルタ結果、Gemini分析結果を実行単位のMedallion JSONとして保存
 
 ## 環境変数
 
@@ -20,6 +21,7 @@ LINE_CHANNEL_ACCESS_TOKEN       LINEチャネルアクセストークン
 LINE_DESTINATION_ID             ユーザー、グループ、またはルームの送信先ID
 LOOKBACK_DAYS                   対象日数。未設定時は7
 RUST_LOG                        ログレベル。未設定時はinfo
+ARTIFACT_ROOT                  Artifact保存root。未設定時はローカルがdata/runs、Lambdaが/tmp/vietnam_law_tracking/runs
 ```
 
 APIキーとアクセストークンはコードやログへ出力しないでください。
@@ -67,4 +69,5 @@ LINE Developers ConsoleでMessaging APIチャネルを作成し、チャネル�
 - ニュースサイトのHTMLやRSS仕様変更には追随が必要です。
 - Geminiが報道内容を正しく解釈できない可能性があるため、重要事項は公式情報で再確認してください。
 - National Law Portalの検索は自動化せず、通知に表示されたベトナム語キーワードと検索ページを使って人間が確認してください。
+- Artifactは`date=YYYYMMDD/run_id=<uuid>/`配下にBronze、Silver、Goldとして保存されます。保存失敗時も本来の通知処理は継続します。
 - 本番運用時には通知部分をAmazon SESへ置き換える予定です。

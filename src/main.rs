@@ -1,4 +1,11 @@
-use std::{collections::HashSet, env, time::Duration};
+use std::{
+    collections::HashSet,
+    env,
+    fs::{File, create_dir_all, rename},
+    io::Write,
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
@@ -10,6 +17,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ARTICLES: usize = 20;
@@ -89,9 +97,9 @@ struct RssFetchResult {
 
 #[derive(Debug)]
 struct ArticleFilterResult {
-    keyword_matched: usize,
-    deduplicated: usize,
-    articles: Vec<Article>,
+    keyword_matched_articles: Vec<Article>,
+    deduplicated_articles: Vec<Article>,
+    selected_articles: Vec<Article>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -117,6 +125,127 @@ struct TargetPeriod {
     end: DateTime<Utc>,
     local_start: NaiveDate,
     local_end: NaiveDate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunContext {
+    run_id: String,
+    run_date: String,
+    started_at: DateTime<Utc>,
+    target_period_start: NaiveDate,
+    target_period_end: NaiveDate,
+}
+
+#[derive(Debug, Serialize)]
+struct BronzeData {
+    run: RunContext,
+    source: String,
+    fetched_count: usize,
+    articles: Vec<Article>,
+}
+
+#[derive(Debug, Serialize)]
+struct SilverStats {
+    rss_fetched: usize,
+    keyword_matched: usize,
+    deduplicated: usize,
+    selected_for_gemini: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SilverData {
+    run: RunContext,
+    stats: SilverStats,
+    keyword_matched_articles: Vec<Article>,
+    deduplicated_articles: Vec<Article>,
+    selected_articles: Vec<Article>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoldData {
+    run: RunContext,
+    changes_count: usize,
+    raw_response: Option<String>,
+    report: Report,
+}
+
+#[derive(Debug)]
+struct GeminiAnalysisResult {
+    raw_response: String,
+    report: Report,
+}
+
+trait ArtifactStore {
+    fn save_bronze(&self, run: &RunContext, data: &BronzeData) -> Result<()>;
+    fn save_silver(&self, run: &RunContext, data: &SilverData) -> Result<()>;
+    fn save_gold(&self, run: &RunContext, data: &GoldData) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+struct LocalArtifactStore {
+    root: PathBuf,
+}
+
+impl LocalArtifactStore {
+    fn from_env() -> Self {
+        let root = env::var_os("ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                if env::var_os("AWS_LAMBDA_FUNCTION_NAME").is_some() {
+                    PathBuf::from("/tmp/vietnam_law_tracking/runs")
+                } else {
+                    PathBuf::from("data/runs")
+                }
+            });
+        Self { root }
+    }
+
+    fn artifact_path(&self, run: &RunContext, name: &str) -> PathBuf {
+        self.root
+            .join(format!("date={}", run.run_date))
+            .join(format!("run_id={}", run.run_id))
+            .join(name)
+    }
+
+    fn save_json<T: Serialize>(&self, run: &RunContext, name: &str, data: &T) -> Result<()> {
+        let path = self.artifact_path(run, name);
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent).with_context(|| {
+                format!("failed to create artifact directory {}", parent.display())
+            })?;
+        }
+        let temporary_path = path.with_extension("json.tmp");
+        let mut file = File::create(&temporary_path).with_context(|| {
+            format!(
+                "failed to create temporary artifact {}",
+                temporary_path.display()
+            )
+        })?;
+        serde_json::to_writer_pretty(&mut file, data)
+            .with_context(|| format!("failed to serialize artifact {}", path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("failed to finish artifact {}", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush artifact {}", temporary_path.display()))?;
+        rename(&temporary_path, &path)
+            .with_context(|| format!("failed to atomically publish artifact {}", path.display()))?;
+        debug!(path = %path.display(), "artifact saved");
+        Ok(())
+    }
+}
+
+impl ArtifactStore for LocalArtifactStore {
+    fn save_bronze(&self, run: &RunContext, data: &BronzeData) -> Result<()> {
+        self.save_json(run, "bronze.json", data)
+    }
+
+    fn save_silver(&self, run: &RunContext, data: &SilverData) -> Result<()> {
+        self.save_json(run, "silver.json", data)
+    }
+
+    fn save_gold(&self, run: &RunContext, data: &GoldData) -> Result<()> {
+        self.save_json(run, "gold.json", data)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,8 +368,21 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
             error!(error = %format!("{err:#}"), "configuration load failed");
             LambdaError::from(err)
         })?;
-    let period = calculate_target_period(Utc::now(), config.lookback_days);
+    let started_at = Utc::now();
+    let period = calculate_target_period(started_at, config.lookback_days);
     info!(start = %period.local_start, end = %period.local_end, "target period calculated");
+    let run = RunContext {
+        run_id: Uuid::new_v4().to_string(),
+        run_date: started_at
+            .with_timezone(&Ho_Chi_Minh)
+            .format("%Y%m%d")
+            .to_string(),
+        started_at,
+        target_period_start: period.local_start,
+        target_period_end: period.local_end,
+    };
+    let artifact_store = LocalArtifactStore::from_env();
+    let mut artifacts_saved = true;
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -267,13 +409,30 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         }
     };
     let rss_fetched = vnexpress.len();
+    let bronze = BronzeData {
+        run: run.clone(),
+        source: "VnExpress".into(),
+        fetched_count: rss_fetched,
+        articles: vnexpress.clone(),
+    };
+    if let Err(err) = artifact_store
+        .save_bronze(&run, &bronze)
+        .context("bronze artifact save failed")
+    {
+        artifacts_saved = false;
+        warn!(error = %format!("{err:#}"), "failed to save bronze artifact");
+    }
 
     let filter_result = filter_and_deduplicate_articles(vnexpress, &period);
-    info!(count = filter_result.keyword_matched, "keyword matched");
-    info!(count = filter_result.deduplicated, "deduplicated");
-    let selected_for_gemini = filter_result.articles.len();
+    let keyword_matched = filter_result.keyword_matched_articles.len();
+    let deduplicated = filter_result.deduplicated_articles.len();
+    let selected_for_gemini = filter_result.selected_articles.len();
+    info!(count = keyword_matched, "keyword matched");
+    info!(count = deduplicated, "deduplicated");
     info!(count = selected_for_gemini, "selected for Gemini");
-    let mut articles = filter_result.articles;
+    let keyword_matched_articles = filter_result.keyword_matched_articles;
+    let deduplicated_articles = filter_result.deduplicated_articles;
+    let mut articles = filter_result.selected_articles;
 
     let enrichment = enrich_article_bodies(&client, &mut articles).await;
     info!(
@@ -283,19 +442,60 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         "article body enrichment completed"
     );
 
-    let report = if articles.is_empty() {
-        create_empty_report()
+    let silver = SilverData {
+        run: run.clone(),
+        stats: SilverStats {
+            rss_fetched,
+            keyword_matched,
+            deduplicated,
+            selected_for_gemini,
+        },
+        keyword_matched_articles,
+        deduplicated_articles,
+        selected_articles: articles.clone(),
+    };
+    if let Err(err) = artifact_store
+        .save_silver(&run, &silver)
+        .context("silver artifact save failed")
+    {
+        artifacts_saved = false;
+        warn!(error = %format!("{err:#}"), "failed to save silver artifact");
+    }
+
+    let analysis = if articles.is_empty() {
+        GeminiAnalysisResult {
+            raw_response: String::new(),
+            report: create_empty_report(),
+        }
     } else {
         match analyze_with_gemini(&client, &config, &period, &articles).await {
-            Ok(report) => report,
+            Ok(analysis) => analysis,
             Err(err) => {
                 error!(error = %format!("{err:#}"), "Gemini processing failed");
                 return Err(err.into());
             }
         }
     };
+    let report = &analysis.report;
+    let gold = GoldData {
+        run: run.clone(),
+        changes_count: report.changes.len(),
+        raw_response: if analysis.raw_response.is_empty() {
+            None
+        } else {
+            Some(analysis.raw_response.clone())
+        },
+        report: report.clone(),
+    };
+    if let Err(err) = artifact_store
+        .save_gold(&run, &gold)
+        .context("gold artifact save failed")
+    {
+        artifacts_saved = false;
+        warn!(error = %format!("{err:#}"), "failed to save gold artifact");
+    }
     info!(count = report.changes.len(), "Gemini changes");
-    let messages = format_line_messages(&period, &report);
+    let messages = format_line_messages(&period, report);
     info!(
         messages = messages.len(),
         changes = report.changes.len(),
@@ -310,10 +510,11 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         })?;
     info!(
         rss_fetched,
-        keyword_matched = filter_result.keyword_matched,
-        deduplicated = filter_result.deduplicated,
+        keyword_matched,
+        deduplicated,
         selected_for_gemini,
         gemini_changes = report.changes.len(),
+        artifacts_saved,
         "weekly law tracking completed"
     );
     Ok(json!({"status": "ok", "changes": report.changes.len()}))
@@ -574,24 +775,27 @@ fn filter_and_deduplicate_articles(
     articles: Vec<Article>,
     period: &TargetPeriod,
 ) -> ArticleFilterResult {
-    let mut articles = articles
+    let keyword_matched_articles = articles
         .into_iter()
         .filter(|article| keyword_match(article) && in_period(article, period))
         .collect::<Vec<_>>();
-    let keyword_matched = articles.len();
+    let mut deduplicated_articles = keyword_matched_articles.clone();
     let mut urls = HashSet::new();
     let mut titles = HashSet::new();
-    articles.retain(|article| {
+    deduplicated_articles.retain(|article| {
         urls.insert(article.url.trim().to_ascii_lowercase())
             && titles.insert(normalize_title(&article.title))
     });
-    let deduplicated = articles.len();
-    articles.sort_by_key(|article| std::cmp::Reverse(article.published_at));
-    articles.truncate(MAX_ARTICLES);
+    deduplicated_articles.sort_by_key(|article| std::cmp::Reverse(article.published_at));
+    let selected_articles = deduplicated_articles
+        .iter()
+        .take(MAX_ARTICLES)
+        .cloned()
+        .collect();
     ArticleFilterResult {
-        keyword_matched,
-        deduplicated,
-        articles,
+        keyword_matched_articles,
+        deduplicated_articles,
+        selected_articles,
     }
 }
 
@@ -668,7 +872,7 @@ async fn analyze_with_gemini(
     config: &Config,
     period: &TargetPeriod,
     articles: &[Article],
-) -> Result<Report> {
+) -> Result<GeminiAnalysisResult> {
     info!(count = articles.len(), "sending articles to Gemini");
     let prompt = build_gemini_prompt(period, articles);
     debug!(prompt_chars = prompt.chars().count(), "Gemini prompt built");
@@ -724,7 +928,10 @@ async fn analyze_with_gemini(
     let mut report: Report =
         serde_json::from_str(&json_text).context("Gemini report JSON parse failed")?;
     normalize_report(&mut report);
-    Ok(report)
+    Ok(GeminiAnalysisResult {
+        raw_response: response,
+        report,
+    })
 }
 
 fn truncate_for_log(text: &str, max_chars: usize) -> String {
@@ -1008,6 +1215,7 @@ fn clean_text(value: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn article(title: &str, url: &str) -> Article {
         Article {
@@ -1017,6 +1225,25 @@ mod tests {
             summary: None,
             body: None,
             source: "test".into(),
+        }
+    }
+
+    fn run_context() -> RunContext {
+        RunContext {
+            run_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            run_date: "20260809".into(),
+            started_at: DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            target_period_start: NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+            target_period_end: NaiveDate::from_ymd_opt(2026, 8, 9).unwrap(),
+        }
+    }
+
+    fn report() -> Report {
+        Report {
+            summary: "ok".into(),
+            changes: Vec::new(),
         }
     }
 
@@ -1052,9 +1279,9 @@ mod tests {
             article(" TAX   LAW ", "https://example.test/b"),
         ];
         let result = filter_and_deduplicate_articles(values, &period);
-        assert_eq!(result.keyword_matched, 2);
-        assert_eq!(result.deduplicated, 1);
-        assert_eq!(result.articles.len(), 1);
+        assert_eq!(result.keyword_matched_articles.len(), 2);
+        assert_eq!(result.deduplicated_articles.len(), 1);
+        assert_eq!(result.selected_articles.len(), 1);
     }
 
     #[test]
@@ -1073,9 +1300,9 @@ mod tests {
             .collect();
 
         let result = filter_and_deduplicate_articles(values, &period);
-        assert_eq!(result.keyword_matched, 25);
-        assert_eq!(result.deduplicated, 25);
-        assert_eq!(result.articles.len(), MAX_ARTICLES);
+        assert_eq!(result.keyword_matched_articles.len(), 25);
+        assert_eq!(result.deduplicated_articles.len(), 25);
+        assert_eq!(result.selected_articles.len(), MAX_ARTICLES);
     }
 
     #[test]
@@ -1095,6 +1322,120 @@ mod tests {
                 failed: 1,
             }
         );
+    }
+
+    #[test]
+    fn builds_partitioned_artifact_path() {
+        let directory = tempdir().unwrap();
+        let store = LocalArtifactStore {
+            root: directory.path().join("runs"),
+        };
+        let path = store.artifact_path(&run_context(), "bronze.json");
+        assert_eq!(
+            path,
+            directory
+                .path()
+                .join("runs/date=20260809/run_id=550e8400-e29b-41d4-a716-446655440000/bronze.json")
+        );
+    }
+
+    #[test]
+    fn serializes_bronze_and_silver_data() {
+        let run = run_context();
+        let bronze = BronzeData {
+            run: run.clone(),
+            source: "VnExpress".into(),
+            fetched_count: 1,
+            articles: vec![article("Tax law", "https://example.test/1")],
+        };
+        let silver = SilverData {
+            run,
+            stats: SilverStats {
+                rss_fetched: 10,
+                keyword_matched: 5,
+                deduplicated: 4,
+                selected_for_gemini: 1,
+            },
+            keyword_matched_articles: Vec::new(),
+            deduplicated_articles: Vec::new(),
+            selected_articles: bronze.articles.clone(),
+        };
+        let bronze_json = serde_json::to_value(&bronze).unwrap();
+        let silver_json = serde_json::to_value(&silver).unwrap();
+        assert_eq!(bronze_json["fetched_count"], 1);
+        assert_eq!(silver_json["stats"]["selected_for_gemini"], 1);
+        assert_eq!(
+            silver_json["selected_articles"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn serializes_gold_with_and_without_raw_response() {
+        let run = run_context();
+        let with_raw = GoldData {
+            run: run.clone(),
+            changes_count: 0,
+            raw_response: Some("{\"candidates\":[]}".into()),
+            report: report(),
+        };
+        let without_raw = GoldData {
+            run,
+            changes_count: 0,
+            raw_response: None,
+            report: report(),
+        };
+        assert_eq!(
+            serde_json::to_value(with_raw).unwrap()["raw_response"],
+            "{\"candidates\":[]}"
+        );
+        assert!(serde_json::to_value(without_raw).unwrap()["raw_response"].is_null());
+    }
+
+    #[test]
+    fn local_artifact_store_writes_all_artifacts_atomically() {
+        let directory = tempdir().unwrap();
+        let store = LocalArtifactStore {
+            root: directory.path().join("runs"),
+        };
+        let run = run_context();
+        let article = article("Tax law", "https://example.test/1");
+        let bronze = BronzeData {
+            run: run.clone(),
+            source: "VnExpress".into(),
+            fetched_count: 1,
+            articles: vec![article.clone()],
+        };
+        let silver = SilverData {
+            run: run.clone(),
+            stats: SilverStats {
+                rss_fetched: 1,
+                keyword_matched: 1,
+                deduplicated: 1,
+                selected_for_gemini: 1,
+            },
+            keyword_matched_articles: vec![article.clone()],
+            deduplicated_articles: vec![article.clone()],
+            selected_articles: vec![article],
+        };
+        let gold = GoldData {
+            run: run.clone(),
+            changes_count: 0,
+            raw_response: None,
+            report: report(),
+        };
+        store.save_bronze(&run, &bronze).unwrap();
+        store.save_silver(&run, &silver).unwrap();
+        store.save_gold(&run, &gold).unwrap();
+
+        for name in ["bronze.json", "silver.json", "gold.json"] {
+            let path = store.artifact_path(&run, name);
+            assert!(path.is_file());
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(contents.ends_with('\n'));
+            assert!(serde_json::from_str::<Value>(&contents).is_ok());
+            assert!(!path.with_extension("json.tmp").exists());
+        }
     }
 
     #[test]
