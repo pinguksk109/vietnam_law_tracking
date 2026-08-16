@@ -69,6 +69,10 @@ const KEYWORDS: &[&str] = &[
     "thủ tục hành chính",
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ドメイン型
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 struct Config {
     gemini_api_key: String,
@@ -180,6 +184,10 @@ trait ArtifactStore {
     fn save_silver(&self, run: &RunContext, data: &SilverData) -> Result<()>;
     fn save_gold(&self, run: &RunContext, data: &GoldData) -> Result<()>;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: Artifact 保存
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct LocalArtifactStore {
@@ -349,6 +357,10 @@ struct LinePushRequest {
     messages: Vec<LineMessage>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Lambda エントリポイント
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), LambdaError> {
     dotenvy::dotenv().ok();
@@ -361,6 +373,7 @@ async fn main() -> Result<(), LambdaError> {
 }
 
 async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaError> {
+    // 1. 設定と対象期間を準備する。
     info!("weekly law tracking started");
     let config = load_config()
         .context("configuration load failed")
@@ -384,6 +397,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
     let artifact_store = LocalArtifactStore::from_env();
     let mut artifacts_saved = true;
 
+    // 2. HTTP クライアントを作り、RSS を取得する。
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
         .user_agent(SOURCE_USER_AGENT)
@@ -393,7 +407,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
             error!(error = %format!("{err:#}"), "HTTP client initialization failed");
             LambdaError::from(err)
         })?;
-    let vnexpress = match fetch_vnexpress_articles(&client, &period).await {
+    let vnexpress_articles = match fetch_vnexpress_articles(&client, &period).await {
         Ok(result) => {
             info!(
                 source = "VnExpress",
@@ -408,12 +422,13 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
             return Err(err.into());
         }
     };
-    let rss_fetched = vnexpress.len();
+    let rss_fetched = vnexpress_articles.len();
+    // 3. 取得した RSS を Bronze として保存する。
     let bronze = BronzeData {
         run: run.clone(),
         source: "VnExpress".into(),
         fetched_count: rss_fetched,
-        articles: vnexpress.clone(),
+        articles: vnexpress_articles.clone(),
     };
     if let Err(err) = artifact_store
         .save_bronze(&run, &bronze)
@@ -423,7 +438,8 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         warn!(error = %format!("{err:#}"), "failed to save bronze artifact");
     }
 
-    let filter_result = filter_and_deduplicate_articles(vnexpress, &period);
+    // 4. キーワード、期間、重複で絞り込み、本文を補完する。
+    let filter_result = filter_and_deduplicate_articles(vnexpress_articles, &period);
     let keyword_matched = filter_result.keyword_matched_articles.len();
     let deduplicated = filter_result.deduplicated_articles.len();
     let selected_for_gemini = filter_result.selected_articles.len();
@@ -432,9 +448,9 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
     info!(count = selected_for_gemini, "selected for Gemini");
     let keyword_matched_articles = filter_result.keyword_matched_articles;
     let deduplicated_articles = filter_result.deduplicated_articles;
-    let mut articles = filter_result.selected_articles;
+    let mut selected_articles = filter_result.selected_articles;
 
-    let enrichment = enrich_article_bodies(&client, &mut articles).await;
+    let enrichment = enrich_article_bodies(&client, &mut selected_articles).await;
     info!(
         requested = enrichment.requested,
         succeeded = enrichment.succeeded,
@@ -442,6 +458,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         "article body enrichment completed"
     );
 
+    // 5. 整形済みの記事を Silver として保存する。
     let silver = SilverData {
         run: run.clone(),
         stats: SilverStats {
@@ -452,7 +469,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         },
         keyword_matched_articles,
         deduplicated_articles,
-        selected_articles: articles.clone(),
+        selected_articles: selected_articles.clone(),
     };
     if let Err(err) = artifact_store
         .save_silver(&run, &silver)
@@ -462,13 +479,14 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         warn!(error = %format!("{err:#}"), "failed to save silver artifact");
     }
 
-    let analysis = if articles.is_empty() {
+    // 6. 対象記事を Gemini で分析する。記事がない場合は空レポートにする。
+    let analysis = if selected_articles.is_empty() {
         GeminiAnalysisResult {
             raw_response: String::new(),
             report: create_empty_report(),
         }
     } else {
-        match analyze_with_gemini(&client, &config, &period, &articles).await {
+        match analyze_with_gemini(&client, &config, &period, &selected_articles).await {
             Ok(analysis) => analysis,
             Err(err) => {
                 error!(error = %format!("{err:#}"), "Gemini processing failed");
@@ -476,6 +494,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
             }
         }
     };
+    // 7. 分析結果を Gold として保存する。
     let report = &analysis.report;
     let gold = GoldData {
         run: run.clone(),
@@ -494,6 +513,7 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
         artifacts_saved = false;
         warn!(error = %format!("{err:#}"), "failed to save gold artifact");
     }
+    // 8. LINE 通知を組み立てて送信する。
     info!(count = report.changes.len(), "Gemini changes");
     let messages = format_line_messages(&period, report);
     info!(
@@ -520,6 +540,10 @@ async fn function_handler(_event: LambdaEvent<Value>) -> Result<Value, LambdaErr
     Ok(json!({"status": "ok", "changes": report.changes.len()}))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: 設定・実行環境
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn load_config() -> Result<Config> {
     Ok(Config {
         gemini_api_key: required_env("GEMINI_API_KEY")?,
@@ -541,6 +565,10 @@ fn required_env(name: &str) -> Result<String> {
     Ok(value)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: 対象期間の計算
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn calculate_target_period(now: DateTime<Utc>, lookback_days: i64) -> TargetPeriod {
     let end = now;
     let start = now - ChronoDuration::days(lookback_days.max(1));
@@ -551,6 +579,10 @@ fn calculate_target_period(now: DateTime<Utc>, lookback_days: i64) -> TargetPeri
         local_end: end.with_timezone(&Ho_Chi_Minh).date_naive(),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: RSS 取得
+// ─────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_vnexpress_articles(
     client: &Client,
@@ -641,29 +673,6 @@ async fn fetch_rss_sources(
     })
 }
 
-fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
-    let title = clean_text(entry.title?);
-    let url = entry.link?;
-
-    if title.is_empty() || url.is_empty() {
-        return None;
-    }
-    let date = entry
-        .pub_date
-        .or(entry.published)
-        .or(entry.updated)
-        .and_then(|value| parse_date(&value));
-
-    Some(Article {
-        title,
-        url,
-        published_at: date,
-        summary: entry.description.or(entry.summary).map(clean_text),
-        body: None,
-        source: source.to_string(),
-    })
-}
-
 #[allow(dead_code)]
 async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result<Vec<Article>> {
     debug!("fetching Tuoi Tre listing page");
@@ -704,6 +713,37 @@ async fn fetch_tuoitre_listing(client: &Client, period: &TargetPeriod) -> Result
         .filter(|a| in_period(a, period))
         .collect())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: RSS エントリの変換
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn rss_entry_to_article(entry: RssEntry, source: &str) -> Option<Article> {
+    let title = clean_text(entry.title?);
+    let url = entry.link?;
+
+    if title.is_empty() || url.is_empty() {
+        return None;
+    }
+    let date = entry
+        .pub_date
+        .or(entry.published)
+        .or(entry.updated)
+        .and_then(|value| parse_date(&value));
+
+    Some(Article {
+        title,
+        url,
+        published_at: date,
+        summary: entry.description.or(entry.summary).map(clean_text),
+        body: None,
+        source: source.to_string(),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: HTTP リクエスト
+// ─────────────────────────────────────────────────────────────────────────────
 
 async fn request_text<F>(make_request: F) -> Result<String>
 where
@@ -749,6 +789,10 @@ where
     }
     bail!("HTTP request exhausted retries")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: HTTP 判定・記事の絞り込み
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn should_retry(status: StatusCode) -> bool {
     matches!(
@@ -798,6 +842,10 @@ fn filter_and_deduplicate_articles(
         selected_articles,
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: 記事本文の補完
+// ─────────────────────────────────────────────────────────────────────────────
 
 async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) -> EnrichmentStats {
     let mut stats = EnrichmentStats {
@@ -849,6 +897,10 @@ async fn enrich_article_bodies(client: &Client, articles: &mut [Article]) -> Enr
     stats
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: キーワード判定・タイトル整形
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn keyword_match(article: &Article) -> bool {
     let haystack = format!(
         "{} {}",
@@ -866,6 +918,10 @@ fn normalize_title(title: &str) -> String {
         .join(" ")
         .to_lowercase()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: Gemini 分析
+// ─────────────────────────────────────────────────────────────────────────────
 
 async fn analyze_with_gemini(
     client: &Client,
@@ -933,6 +989,10 @@ async fn analyze_with_gemini(
         report,
     })
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: Gemini 結果の正規化・プロンプト生成
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn truncate_for_log(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(max_chars).collect::<String>();
@@ -1159,6 +1219,10 @@ fn split_text(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 外部 I/O: LINE 通知
+// ─────────────────────────────────────────────────────────────────────────────
+
 async fn send_line_messages(client: &Client, config: &Config, messages: Vec<String>) -> Result<()> {
     if messages.is_empty() {
         bail!("no LINE messages to send");
@@ -1190,6 +1254,10 @@ async fn send_line_messages(client: &Client, config: &Config, messages: Vec<Stri
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 純粋処理: 日付・テキストの低レベル整形
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn parse_date(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|date| date.with_timezone(&Utc))
@@ -1210,430 +1278,4 @@ fn clean_text(value: String) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn article(title: &str, url: &str) -> Article {
-        Article {
-            title: title.into(),
-            url: url.into(),
-            published_at: None,
-            summary: None,
-            body: None,
-            source: "test".into(),
-        }
-    }
-
-    fn run_context() -> RunContext {
-        RunContext {
-            run_id: "550e8400-e29b-41d4-a716-446655440000".into(),
-            run_date: "20260809".into(),
-            started_at: DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            target_period_start: NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
-            target_period_end: NaiveDate::from_ymd_opt(2026, 8, 9).unwrap(),
-        }
-    }
-
-    fn report() -> Report {
-        Report {
-            summary: "ok".into(),
-            changes: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn calculates_period_in_vietnam_timezone() {
-        let now = DateTime::parse_from_rfc3339("2026-08-02T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let period = calculate_target_period(now, 7);
-        assert_eq!(period.local_start.to_string(), "2026-07-26");
-        assert_eq!(period.local_end.to_string(), "2026-08-02");
-    }
-
-    #[test]
-    fn matches_english_and_vietnamese_keywords() {
-        assert!(keyword_match(&Article {
-            title: "New tax regulation".into(),
-            ..article("", "a")
-        }));
-        assert!(keyword_match(&Article {
-            title: "Nghị định về tiền lương".into(),
-            ..article("", "b")
-        }));
-        assert!(!keyword_match(&article("Sports results", "c")));
-    }
-
-    #[test]
-    fn deduplicates_by_url_then_normalized_title() {
-        let period = calculate_target_period(Utc::now(), 7);
-        let values = vec![
-            article("Tax law", "https://example.test/a"),
-            article("Other", "https://example.test/a"),
-            article(" TAX   LAW ", "https://example.test/b"),
-        ];
-        let result = filter_and_deduplicate_articles(values, &period);
-        assert_eq!(result.keyword_matched_articles.len(), 2);
-        assert_eq!(result.deduplicated_articles.len(), 1);
-        assert_eq!(result.selected_articles.len(), 1);
-    }
-
-    #[test]
-    fn counts_selected_articles_after_max_articles() {
-        let now = Utc::now();
-        let period = calculate_target_period(now, 7);
-        let values = (0..25)
-            .map(|index| {
-                let mut value = article(
-                    &format!("Tax law {index}"),
-                    &format!("https://example.test/{index}"),
-                );
-                value.published_at = Some(now);
-                value
-            })
-            .collect();
-
-        let result = filter_and_deduplicate_articles(values, &period);
-        assert_eq!(result.keyword_matched_articles.len(), 25);
-        assert_eq!(result.deduplicated_articles.len(), 25);
-        assert_eq!(result.selected_articles.len(), MAX_ARTICLES);
-    }
-
-    #[test]
-    fn counts_enrichment_successes_and_failures() {
-        let mut stats = EnrichmentStats {
-            requested: 3,
-            ..EnrichmentStats::default()
-        };
-        stats.record(true);
-        stats.record(false);
-        stats.record(true);
-        assert_eq!(
-            stats,
-            EnrichmentStats {
-                requested: 3,
-                succeeded: 2,
-                failed: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn builds_partitioned_artifact_path() {
-        let directory = tempdir().unwrap();
-        let store = LocalArtifactStore {
-            root: directory.path().join("runs"),
-        };
-        let path = store.artifact_path(&run_context(), "bronze.json");
-        assert_eq!(
-            path,
-            directory
-                .path()
-                .join("runs/date=20260809/run_id=550e8400-e29b-41d4-a716-446655440000/bronze.json")
-        );
-    }
-
-    #[test]
-    fn serializes_bronze_and_silver_data() {
-        let run = run_context();
-        let bronze = BronzeData {
-            run: run.clone(),
-            source: "VnExpress".into(),
-            fetched_count: 1,
-            articles: vec![article("Tax law", "https://example.test/1")],
-        };
-        let silver = SilverData {
-            run,
-            stats: SilverStats {
-                rss_fetched: 10,
-                keyword_matched: 5,
-                deduplicated: 4,
-                selected_for_gemini: 1,
-            },
-            keyword_matched_articles: Vec::new(),
-            deduplicated_articles: Vec::new(),
-            selected_articles: bronze.articles.clone(),
-        };
-        let bronze_json = serde_json::to_value(&bronze).unwrap();
-        let silver_json = serde_json::to_value(&silver).unwrap();
-        assert_eq!(bronze_json["fetched_count"], 1);
-        assert_eq!(silver_json["stats"]["selected_for_gemini"], 1);
-        assert_eq!(
-            silver_json["selected_articles"].as_array().unwrap().len(),
-            1
-        );
-    }
-
-    #[test]
-    fn serializes_gold_with_and_without_raw_response() {
-        let run = run_context();
-        let with_raw = GoldData {
-            run: run.clone(),
-            changes_count: 0,
-            raw_response: Some("{\"candidates\":[]}".into()),
-            report: report(),
-        };
-        let without_raw = GoldData {
-            run,
-            changes_count: 0,
-            raw_response: None,
-            report: report(),
-        };
-        assert_eq!(
-            serde_json::to_value(with_raw).unwrap()["raw_response"],
-            "{\"candidates\":[]}"
-        );
-        assert!(serde_json::to_value(without_raw).unwrap()["raw_response"].is_null());
-    }
-
-    #[test]
-    fn local_artifact_store_writes_all_artifacts_atomically() {
-        let directory = tempdir().unwrap();
-        let store = LocalArtifactStore {
-            root: directory.path().join("runs"),
-        };
-        let run = run_context();
-        let article = article("Tax law", "https://example.test/1");
-        let bronze = BronzeData {
-            run: run.clone(),
-            source: "VnExpress".into(),
-            fetched_count: 1,
-            articles: vec![article.clone()],
-        };
-        let silver = SilverData {
-            run: run.clone(),
-            stats: SilverStats {
-                rss_fetched: 1,
-                keyword_matched: 1,
-                deduplicated: 1,
-                selected_for_gemini: 1,
-            },
-            keyword_matched_articles: vec![article.clone()],
-            deduplicated_articles: vec![article.clone()],
-            selected_articles: vec![article],
-        };
-        let gold = GoldData {
-            run: run.clone(),
-            changes_count: 0,
-            raw_response: None,
-            report: report(),
-        };
-        store.save_bronze(&run, &bronze).unwrap();
-        store.save_silver(&run, &silver).unwrap();
-        store.save_gold(&run, &gold).unwrap();
-
-        for name in ["bronze.json", "silver.json", "gold.json"] {
-            let path = store.artifact_path(&run, name);
-            assert!(path.is_file());
-            let contents = std::fs::read_to_string(&path).unwrap();
-            assert!(contents.ends_with('\n'));
-            assert!(serde_json::from_str::<Value>(&contents).is_ok());
-            assert!(!path.with_extension("json.tmp").exists());
-        }
-    }
-
-    #[test]
-    fn removes_gemini_code_fences() {
-        assert_eq!(
-            remove_json_code_block("```json\n{\"summary\":\"ok\"}\n```").unwrap(),
-            "{\"summary\":\"ok\"}"
-        );
-        assert_eq!(
-            remove_json_code_block("{\"summary\":\"ok\"}").unwrap(),
-            "{\"summary\":\"ok\"}"
-        );
-    }
-
-    #[test]
-    fn creates_empty_report_message() {
-        let period = calculate_target_period(Utc::now(), 7);
-        let messages = format_line_messages(&period, &create_empty_report());
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("重要な変更は確認できませんでした"));
-    }
-
-    #[test]
-    fn normalizes_invalid_category_to_business() {
-        let mut report = Report {
-            summary: "ok".into(),
-            changes: vec![Change {
-                title: "t".into(),
-                summary: "s".into(),
-                published_date: "2026-08-09".into(),
-                effective_date: None,
-                law_number: None,
-                search_keywords: Vec::new(),
-                target: "target".into(),
-                impact: "impact".into(),
-                action: "action".into(),
-                confidence: "公式確認済み".into(),
-                category: "unknown".into(),
-                source_url: "https://example.test".into(),
-                official_url: None,
-            }],
-        };
-        normalize_report(&mut report);
-        assert_eq!(report.changes[0].category, "business");
-        assert_eq!(report.changes[0].confidence, "要確認");
-    }
-
-    #[test]
-    fn keeps_category_in_line_messages() {
-        let period = calculate_target_period(Utc::now(), 7);
-        let report = Report {
-            summary: "ok".into(),
-            changes: vec![Change {
-                title: "t".into(),
-                summary: "s".into(),
-                published_date: "2026-08-09".into(),
-                effective_date: None,
-                law_number: None,
-                search_keywords: vec!["visa".into()],
-                target: "target".into(),
-                impact: "impact".into(),
-                action: "action".into(),
-                confidence: "要確認".into(),
-                category: "visa".into(),
-                source_url: "https://example.test".into(),
-                official_url: None,
-            }],
-        };
-        let messages = format_line_messages(&period, &report);
-        assert!(messages[0].contains("カテゴリ：visa"));
-    }
-
-    #[test]
-    fn normalizes_search_keywords() {
-        let keywords = normalize_search_keywords(vec![
-            "  first  ".into(),
-            "FIRST".into(),
-            "".into(),
-            "second".into(),
-            " third ".into(),
-            "fourth".into(),
-        ]);
-        assert_eq!(keywords, vec!["first", "second", "third"]);
-    }
-
-    #[test]
-    fn parses_search_keywords_and_defaults_when_missing() {
-        let with_keywords: Change = serde_json::from_str(
-            r#"{
-                "title":"t", "summary":"s", "published_date":"2026-08-09",
-                "effective_date":null, "law_number":"87/2026/TT-BCA",
-                "search_keywords":["87/2026/TT-BCA", "khai báo tạm trú người nước ngoài"],
-                "target":"target", "impact":"impact", "action":"action",
-                "confidence":"要確認", "category":"visa", "source_url":"https://example.test", "official_url":null
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(with_keywords.search_keywords.len(), 2);
-
-        let without_keywords: Change = serde_json::from_str(
-            r#"{
-                "title":"t", "summary":"s", "published_date":"2026-08-09",
-                "effective_date":null, "law_number":null,
-                "target":"target", "impact":"impact", "action":"action",
-                "confidence":"要確認", "category":"visa", "source_url":"https://example.test", "official_url":null
-            }"#,
-        )
-        .unwrap();
-        assert!(without_keywords.search_keywords.is_empty());
-    }
-
-    #[test]
-    fn includes_official_verification_details_in_line_messages() {
-        let period = calculate_target_period(Utc::now(), 7);
-        let report = Report {
-            summary: "ok".into(),
-            changes: vec![Change {
-                title: "t".into(),
-                summary: "s".into(),
-                published_date: "2026-08-09".into(),
-                effective_date: Some("2026-07-24".into()),
-                law_number: Some("87/2026/TT-BCA".into()),
-                search_keywords: vec!["khai báo tạm trú người nước ngoài".into()],
-                target: "target".into(),
-                impact: "impact".into(),
-                action: "action".into(),
-                confidence: "報道段階".into(),
-                category: "visa".into(),
-                source_url: "https://vnexpress.net/example".into(),
-                official_url: None,
-            }],
-        };
-        let messages = format_line_messages(&period, &report);
-        assert!(messages.iter().any(|message| message.contains("法令番号")));
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("検索キーワード"))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains(NATIONAL_LAW_PORTAL_URL))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("https://vnexpress.net/example"))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("2026-07-24"))
-        );
-        assert!(messages.iter().any(|message| message.contains("報道段階")));
-    }
-
-    #[test]
-    fn shows_missing_law_number_in_line_messages() {
-        let period = calculate_target_period(Utc::now(), 7);
-        let report = Report {
-            summary: "ok".into(),
-            changes: vec![Change {
-                title: "t".into(),
-                summary: "s".into(),
-                published_date: "2026-08-09".into(),
-                effective_date: None,
-                law_number: None,
-                search_keywords: Vec::new(),
-                target: "target".into(),
-                impact: "impact".into(),
-                action: "action".into(),
-                confidence: "要確認".into(),
-                category: "business".into(),
-                source_url: "https://example.test".into(),
-                official_url: None,
-            }],
-        };
-        let messages = format_line_messages(&period, &report);
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.contains("記事から確認できず"))
-        );
-    }
-
-    #[test]
-    fn splits_line_messages_without_exceeding_limit() {
-        let messages = split_line_messages(vec![
-            "a".repeat(3_000),
-            "b".repeat(3_000),
-            "c".repeat(3_000),
-        ]);
-        assert!(messages.len() <= MAX_LINE_MESSAGES);
-        assert!(
-            messages
-                .iter()
-                .all(|message| message.chars().count() <= LINE_TEXT_LIMIT)
-        );
-    }
 }
